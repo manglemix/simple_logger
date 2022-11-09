@@ -251,10 +251,7 @@ impl<'a, T: Eq + Send + Hash + Clone + 'static> LogDumpHandle<'a, T> {
 
 impl<T: Eq + Send + Hash + Clone + 'static> Default for Logger<T> {
 	fn default() -> Self {
-		Self {
-			senders: Default::default(),
-			thr_handles: Default::default(),
-		}
+		Self::new()
 	}
 }
 
@@ -263,7 +260,10 @@ impl<T: Eq + Send + Hash + Clone + 'static> Logger<T> {
 	/// Create a new Logger with no attached LogDumps.
 	/// Equivalent to default
 	pub fn new() -> Self {
-		Self::default()
+		Self {
+			senders: Default::default(),
+			thr_handles: Default::default(),
+		}
 	}
 
 	fn detach_log_dump(&self, idx: usize) {
