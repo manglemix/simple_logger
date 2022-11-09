@@ -164,10 +164,7 @@ pub struct Logger<T: Eq + Send + Hash + Clone + 'static> {
 /// [log]: crate::Logger::log
 /// [wait]: crate::LogReady::wait
 /// [LogDump]: crate::LogDump
-pub struct LogReady {
-	count: usize,
-	receiver: Receiver<()>
-}
+pub struct LogReady(Option<(usize, Receiver<()>)>);
 
 
 impl LogReady {
@@ -175,31 +172,10 @@ impl LogReady {
 	///
 	/// [LogDump]: crate::LogDump
 	pub fn wait(self) {
-		for _ in 0..self.count {
-			if self.receiver.recv().is_err() {
-				return
-			}
-		}
-	}
-
-	/// Awaits until all logs are processd
-	///
-	/// The given task will be called repeatedly, with the future awaited on.
-	/// This is essentially the polling rate
-	///
-	/// Usually this would be a sleep task
-	pub async fn wait_async<F, Fut>(self, task: F)
-		where
-			Fut: Future,
-			F: Fn() -> Fut
-	{
-		for _ in 0..self.count {
-			loop {
-				match self.receiver.try_recv() {
-					Err(TryRecvError::Empty) => {
-						task().await;
-					}
-					_ => break,
+		if let Some((count, receiver)) = self.0 {
+			for _ in 0..count {
+				if receiver.recv().is_err() {
+					return
 				}
 			}
 		}
@@ -375,10 +351,9 @@ impl<T: Eq + Send + Hash + Clone + 'static> Logger<T> {
 	pub fn log<M: Display>(&self, message: M, log_type: T, trace_data: Option<(&'static str, u32)>) -> LogReady {
 		let lock = self.senders.lock().unwrap();
 
-		assert!(
-			!lock.is_empty(),
-			"There are no attached log dumps! They may have been explicitly dropped"
-		);
+		if lock.is_empty() {
+			return LogReady(None)
+		}
 
 		let (sender, receiver) = channel();
 
@@ -395,10 +370,7 @@ impl<T: Eq + Send + Hash + Clone + 'static> Logger<T> {
 			}).unwrap();
 		}
 
-		LogReady {
-			count: lock.len(),
-			receiver
-		}
+		LogReady(Some((lock.len(), receiver)))
 	}
 }
 
