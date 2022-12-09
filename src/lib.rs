@@ -143,6 +143,11 @@ struct LogDumpProcess<T: Eq + Send + Hash + Clone + 'static> {
 	sender: Sender<LogData<T>>,
 	paused: bool
 }
+struct LoggerInternal<T: Eq + Send + Hash + Clone + 'static> {
+	senders: HashMap<usize, LogDumpProcess<T>>,
+	thr_handles: Vec<JoinHandle<()>>,
+	filter: HashSet<T>
+}
 
 
 /// A Logger that facilitates the sending of logs to [LogDump]s.
@@ -151,13 +156,6 @@ struct LogDumpProcess<T: Eq + Send + Hash + Clone + 'static> {
 /// When dropped, the Logger will wait on all [LogDump] threads to terminate (which will drop the [LogDump]s)
 ///
 /// [LogDump]: crate::LogDump
-struct LoggerInternal<T: Eq + Send + Hash + Clone + 'static> {
-	senders: HashMap<usize, LogDumpProcess<T>>,
-	thr_handles: Vec<JoinHandle<()>>,
-	filter: HashSet<T>
-}
-
-
 pub struct Logger<T: Eq + Send + Hash + Clone + 'static>(Lazy<Mutex<LoggerInternal<T>>>);
 
 
@@ -243,7 +241,6 @@ impl<'a, T: Eq + Send + Hash + Clone + 'static> LogDumpHandle<'a, T> {
 
 
 impl<T: Eq + Send + Hash + Clone + 'static> Logger<T> {
-
 	fn detach_log_dump(&self, idx: usize) {
 		self.0.lock().unwrap().senders.remove(&idx);
 	}
@@ -254,6 +251,26 @@ impl<T: Eq + Send + Hash + Clone + 'static> Logger<T> {
 
 	fn unpause_log_dump(&self, idx: usize) {
 		self.0.lock().unwrap().senders.get_mut(&idx).unwrap().paused = false;
+	}
+
+	/// Get a copy of the filters used when logging
+	pub fn get_filters(&self) -> HashSet<T> {
+		self.0.lock().unwrap().filter.clone()
+	}
+
+	/// Add a new filter to the logger
+	pub fn add_filter(&self, filter: T) -> bool {
+		let mut lock = self.0.lock().unwrap();
+		let result = lock.filter.insert(filter);
+		lock.filter.shrink_to_fit();
+		result
+		
+	}
+
+	/// Replace all the filters in the logger with the given HashSet
+	pub fn replace_filters(&self, mut new: HashSet<T>) {
+		new.shrink_to_fit();
+		self.0.lock().unwrap().filter = new;
 	}
 
 	/// Attach a LogDump to this Logger instance.
@@ -347,7 +364,7 @@ impl<T: Eq + Send + Hash + Clone + 'static> Logger<T> {
 	pub fn log<M: Display>(&self, message: M, log_type: T, trace_data: Option<(&'static str, u32)>) -> LogReady {
 		let log_lock = self.0.lock().unwrap();
 
-		if !log_lock.filter.contains(&log_type) {
+		if  !log_lock.filter.is_empty() && !log_lock.filter.contains(&log_type) {
 			return LogReady(None)
 		}
 
@@ -513,18 +530,6 @@ define_log_define!(Debug, define_debug, debug,
 ///
 /// Both arguments can also be passed
 );
-
-
-// #[macro_export]
-// macro_rules! set {
-//     ($($arg: tt),*) => {{
-// 		let mut set = std::collections::HashSet::new();
-// 		$(
-// 			set.insert($arg);
-// 		)*
-// 		set
-// 	}};
-// }
 
 
 pub mod prelude {
