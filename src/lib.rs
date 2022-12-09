@@ -156,7 +156,7 @@ struct LoggerInternal<T: Eq + Send + Hash + Clone + 'static> {
 /// When dropped, the Logger will wait on all [LogDump] threads to terminate (which will drop the [LogDump]s)
 ///
 /// [LogDump]: crate::LogDump
-pub struct Logger<T: Eq + Send + Hash + Clone + 'static>(Lazy<Mutex<LoggerInternal<T>>>);
+pub struct Logger<T: Eq + Send + Hash + Clone + 'static=LogLevel>(Lazy<Mutex<LoggerInternal<T>>>);
 
 
 impl<T: Eq + Send + Hash + Clone + 'static> Logger<T> {
@@ -542,7 +542,7 @@ pub mod prelude {
 mod tests {
 	use crate::prelude::*;
 	use formatters::default_format;
-    pub static LOGGER: Logger<LogLevel> = Logger::<LogLevel>::new();
+    pub static LOGGER: Logger = Logger::new();
     define_warn!(LOGGER);
     define_debug!(LOGGER, trace);
 
