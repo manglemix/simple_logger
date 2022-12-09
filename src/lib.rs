@@ -9,16 +9,16 @@ use std::io::Error;
 use std::fs::{OpenOptions};
 pub use std::{fs::File, io::Stderr};
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use std::hash::Hash;
 use std::io::{stderr, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex};
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::{JoinHandle, spawn};
 use chrono::Local;
 use colored::{Colorize};
-pub use lazy_static::lazy_static;
+use once_cell::sync::Lazy;
+// pub use lazy_static::lazy_static;
 use crate::formatters::LogData;
 
 
@@ -151,9 +151,26 @@ struct LogDumpProcess<T: Eq + Send + Hash + Clone + 'static> {
 /// When dropped, the Logger will wait on all [LogDump] threads to terminate (which will drop the [LogDump]s)
 ///
 /// [LogDump]: crate::LogDump
-pub struct Logger<T: Eq + Send + Hash + Clone + 'static> {
-	senders: Mutex<HashMap<usize, LogDumpProcess<T>>>,
-	thr_handles: Mutex<Vec<JoinHandle<()>>>,
+struct LoggerInternal<T: Eq + Send + Hash + Clone + 'static> {
+	senders: HashMap<usize, LogDumpProcess<T>>,
+	thr_handles: Vec<JoinHandle<()>>,
+	filter: HashSet<T>
+}
+
+
+pub struct Logger<T: Eq + Send + Hash + Clone + 'static>(Lazy<Mutex<LoggerInternal<T>>>);
+
+
+impl<T: Eq + Send + Hash + Clone + 'static> Logger<T> {
+	/// Create a new Logger with no attached LogDumps.
+	/// Equivalent to default
+	pub const fn new() -> Self {
+		Self(Lazy::new(|| Mutex::new(LoggerInternal {
+			senders: Default::default(),
+			thr_handles: Default::default(),
+			filter: Default::default(),
+		})))
+	}
 }
 
 
@@ -225,33 +242,18 @@ impl<'a, T: Eq + Send + Hash + Clone + 'static> LogDumpHandle<'a, T> {
 }
 
 
-impl<T: Eq + Send + Hash + Clone + 'static> Default for Logger<T> {
-	fn default() -> Self {
-		Self::new()
-	}
-}
-
-
 impl<T: Eq + Send + Hash + Clone + 'static> Logger<T> {
-	/// Create a new Logger with no attached LogDumps.
-	/// Equivalent to default
-	pub fn new() -> Self {
-		Self {
-			senders: Default::default(),
-			thr_handles: Default::default(),
-		}
-	}
 
 	fn detach_log_dump(&self, idx: usize) {
-		self.senders.lock().unwrap().remove(&idx);
+		self.0.lock().unwrap().senders.remove(&idx);
 	}
 
 	fn pause_log_dump(&self, idx: usize) {
-		self.senders.lock().unwrap().get_mut(&idx).unwrap().paused = true;
+		self.0.lock().unwrap().senders.get_mut(&idx).unwrap().paused = true;
 	}
 
 	fn unpause_log_dump(&self, idx: usize) {
-		self.senders.lock().unwrap().get_mut(&idx).unwrap().paused = false;
+		self.0.lock().unwrap().senders.get_mut(&idx).unwrap().paused = false;
 	}
 
 	/// Attach a LogDump to this Logger instance.
@@ -264,29 +266,24 @@ impl<T: Eq + Send + Hash + Clone + 'static> Logger<T> {
 	/// Returned is a [LogDumpHandle] that allows termination of the spawned thread if needed. Dropping it will not do anything and is safe.
 	///
 	/// [LogDumpHandle]: crate::LogDumpHandle
-	pub fn attach_log_dump<D: LogDump<T> + Send + 'static, S: IntoIterator<Item=T>>(&self, mut dump: D, filter: S, always_flush: bool) -> LogDumpHandle<'_, T> {
-		let filter = HashSet::<T>::from_iter(filter);
+	pub fn attach_log_dump<D: LogDump<T> + Send + 'static>(&self, mut dump: D, always_flush: bool) -> LogDumpHandle<'_, T> {
 		let (log_sender, log_receiver) = channel();
+		let mut log_lock = self.0.lock().unwrap();
 
-		let mut senders_lock = self.senders.lock().unwrap();
-		let mut index = senders_lock.len();
-		while senders_lock.contains_key(&index) {
+		let mut index = log_lock.senders.len();
+		while log_lock.senders.contains_key(&index) {
 			index += 1;
 		}
-		senders_lock.insert(
+		log_lock.senders.insert(
 			index,
 			LogDumpProcess {
 				sender: log_sender,
 				paused: false
 			}
 		);
-		drop(senders_lock);
 
 		let thr = spawn(move || {
 			while let Ok(log) = log_receiver.recv() {
-				if !filter.is_empty() && !filter.contains(&log.log_type) {
-					continue
-				}
 				let sender = log.log_processed.clone();
 				dump.write_log(log, always_flush);
 				let _ = sender.send(());
@@ -294,7 +291,7 @@ impl<T: Eq + Send + Hash + Clone + 'static> Logger<T> {
 			drop(dump);
 		});
 
-		self.thr_handles.lock().unwrap().push(thr);
+		log_lock.thr_handles.push(thr);
 
 		LogDumpHandle {
 			logger_ref: self,
@@ -305,38 +302,37 @@ impl<T: Eq + Send + Hash + Clone + 'static> Logger<T> {
 	/// Attach a Log File. Usage of this method is encouraged over [attach_log_dump] as this will correctly open a log file
 	///
 	/// [attach_log_dump]: crate::Logger::attach_log_dump
-	pub fn attach_log_file<P: AsRef<Path>, S: IntoIterator<Item=T>>(&self, path: P, formatter: Formatter<T>, filter: S, always_flush: bool) -> Result<LogDumpHandle<'_, T>, Error> {
+	pub fn attach_log_file<P: AsRef<Path>>(&self, path: P, formatter: Formatter<T>, always_flush: bool) -> Result<LogDumpHandle<'_, T>, Error> {
 		let path = path.as_ref();
 		OpenOptions::new()
 			.append(true)
 			.create(true)
 			.open(path)
 			.map(|file| {
-				self.attach_log_dump(LogFile { file, path: path.to_path_buf(), formatter }, filter, always_flush)
+				self.attach_log_dump(LogFile { file, path: path.to_path_buf(), formatter }, always_flush)
 			})
 	}
 
 	/// Attach an output to [stderr] (ie. the console)
 	///
 	/// [stderr]: std::io::Stderr
-	pub fn attach_stderr<S: IntoIterator<Item=T>>(&self, formatter: Formatter<T>, filter: S, always_flush: bool) -> LogDumpHandle<'_, T> {
-		self.attach_log_dump(PlainStderr { stderr: stderr(), formatter }, filter, always_flush)
+	pub fn attach_stderr(&self, formatter: Formatter<T>, always_flush: bool) -> LogDumpHandle<'_, T> {
+		self.attach_log_dump(PlainStderr { stderr: stderr(), formatter }, always_flush)
 	}
 
 	/// Returns true iff there are [LogDump]s attached
 	///
 	/// [LogDump]: crate::LogDump
 	pub fn has_attachments(&self) -> bool {
-		!self.senders.lock().unwrap().is_empty()
+		!self.0.lock().unwrap().senders.is_empty()
 	}
 
 	/// Prevent this logger from rerouting logs to [LogDump]s.
-	/// All calls to [log] will now panic
 	///
 	/// [LogDump]: crate::LogDump
 	/// [log]: crate::Logger::log
 	pub fn close_logger(&self) {
-		self.senders.lock().unwrap().clear();
+		self.0.lock().unwrap().senders.clear();
 	}
 
 	/// Send a log to all [LogDump]s
@@ -349,15 +345,19 @@ impl<T: Eq + Send + Hash + Clone + 'static> Logger<T> {
 	/// [LogDump]: crate::LogDump
 	/// [LogReady]: crate::LogReady
 	pub fn log<M: Display>(&self, message: M, log_type: T, trace_data: Option<(&'static str, u32)>) -> LogReady {
-		let lock = self.senders.lock().unwrap();
+		let log_lock = self.0.lock().unwrap();
 
-		if lock.is_empty() {
+		if !log_lock.filter.contains(&log_type) {
+			return LogReady(None)
+		}
+
+		if log_lock.senders.is_empty() {
 			return LogReady(None)
 		}
 
 		let (sender, receiver) = channel();
 
-		for process in lock.values() {
+		for process in log_lock.senders.values() {
 			if process.paused {
 				continue
 			}
@@ -370,7 +370,7 @@ impl<T: Eq + Send + Hash + Clone + 'static> Logger<T> {
 			}).unwrap();
 		}
 
-		LogReady(Some((lock.len(), receiver)))
+		LogReady(Some((log_lock.senders.len(), receiver)))
 	}
 }
 
@@ -380,8 +380,8 @@ impl Logger<LogLevel> {
 	/// Color will be printed as well
 	///
 	/// [stderr]: std::io::Stderr
-	pub fn attach_colored_stderr<S: IntoIterator<Item=LogLevel>>(&self, formatter: Formatter<LogLevel>, filter: S, always_flush: bool) -> LogDumpHandle<'_, LogLevel> {
-		self.attach_log_dump(ColoredStderr { stderr: stderr(), formatter }, filter, always_flush)
+	pub fn attach_colored_stderr(&self, formatter: Formatter<LogLevel>, always_flush: bool) -> LogDumpHandle<'_, LogLevel> {
+		self.attach_log_dump(ColoredStderr { stderr: stderr(), formatter }, always_flush)
 	}
 }
 
@@ -390,7 +390,7 @@ impl<T: Eq + Send + Hash + Clone + 'static> Drop for Logger<T> {
 	fn drop(&mut self) {
 		// wait for all threads to exit
 		self.close_logger();
-		for handle in self.thr_handles.lock().unwrap().drain(..) {
+		for handle in self.0.lock().unwrap().thr_handles.drain(..) {
 			handle.join().unwrap();
 		}
 	}
@@ -418,24 +418,6 @@ impl Logger<LogLevel> {
 	pub fn warn<T: Display>(&self, msg: T, trace_data: Option<(&'static str, u32)>) {
 		self.log(msg, LogLevel::Warn, trace_data);
 	}
-}
-
-
-/// Properly declare a [Logger] instance with the given name and log_type
-///
-/// declare_logger!(\[pub] \<NAME>) to make public
-///
-/// [Logger]: crate::Logger
-#[macro_export]
-macro_rules! declare_logger {
-    ($([$vis: tt])? $name: ident) => {
-		declare_logger!($([$vis])? $name, $crate::LogLevel);
-    };
-    ($([$vis: tt])? $name: ident, $log_type: ty) => {
-		$crate::lazy_static! {
-			$($vis)? static ref $name: $crate::Logger<$log_type> = $crate::Logger::new();
-		}
-    };
 }
 
 
@@ -547,25 +529,23 @@ define_log_define!(Debug, define_debug, debug,
 
 pub mod prelude {
 	pub use {define_info, define_warn, define_error, define_debug};
-	pub use super::declare_logger;
-	pub use super::LogLevel;
-	pub use super::formatters;
+	pub use super::{LogLevel, formatters, Logger};
 }
 
 
 #[cfg(test)]
 mod tests {
-	use std::collections::HashSet;
-	use crate::formatters::default_format;
-    declare_logger!{[pub] LMAO}
-    define_warn!(LMAO);
-    define_debug!(LMAO, trace);
+	use crate::prelude::*;
+	use formatters::default_format;
+    pub static LOGGER: Logger<LogLevel> = Logger::<LogLevel>::new();
+    define_warn!(LOGGER);
+    define_debug!(LOGGER, trace);
 
     #[test]
     fn it_works() {
-		let handle = LMAO.attach_colored_stderr(default_format, HashSet::new(), true);
+		let handle = LOGGER.attach_colored_stderr(default_format, true);
 		warn!("lmao");
-		LMAO.attach_colored_stderr(default_format, HashSet::new(), true);
+		LOGGER.attach_colored_stderr(default_format,  true);
 		handle.close();
 		warn!("lma3o");
 		debug!("waml");
